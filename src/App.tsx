@@ -137,6 +137,8 @@ export default function App() {
 
   const [isSidePanelOpen, setIsSidePanelOpen] = useState(false);
   const [sidePanelTab, setSidePanelTab] = useState<'chat' | 'watch'>('chat');
+  const [isWatchFullScreen, setIsWatchFullScreen] = useState(false);
+  const [showControls, setShowControls] = useState(true);
 
   // --- Refs ---
   const peerRef = useRef<Peer | null>(null);
@@ -172,7 +174,20 @@ export default function App() {
       peerRef.current.destroy();
     }
 
-    const peer = new Peer(id);
+    const peer = new Peer(id, {
+      debug: 1,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:global.stun.twilio.com:3478' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+        iceCandidatePoolSize: 10,
+      }
+    });
     peerRef.current = peer;
 
     peer.on('open', (assigned) => {
@@ -184,25 +199,40 @@ export default function App() {
     peer.on('error', (err) => {
       console.error('[PeerJS Error]', err);
       
+      const isConnectionLost = err.type === 'network' || 
+                               err.type === 'server-error' || 
+                               err.type === 'socket-error' ||
+                               err.type === 'socket-closed' ||
+                               err.message?.toLowerCase().includes('lost connection') ||
+                               err.message?.toLowerCase().includes('disconnected');
+
       if (err.type === 'unavailable-id') {
         const newId = generate4DigitId();
         setTimeout(() => {
           initPeer(newId);
           showToast('ID was taken, assigned a new one', 'info');
-        }, 500);
-      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+        }, 1000);
+      } else if (isConnectionLost) {
         setCallStatus('Offline');
-        showToast('Connection lost. Retrying...', 'error');
+        setMyId(''); // Clear ID to show connecting state
+        showToast('Connection lost. Attempting to reconnect...', 'error');
         
         setTimeout(() => {
           if (peerRef.current && !peerRef.current.destroyed) {
             if (peerRef.current.disconnected) {
+              console.log('Attempting PeerJS reconnection...');
               peerRef.current.reconnect();
+            } else {
+              console.log('Network error but not disconnected, re-initializing...');
+              initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
             }
           } else {
             initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
           }
         }, 5000);
+      } else if (err.type === 'peer-unavailable') {
+        showToast('Peer is not online or ID is incorrect', 'error');
+        setCallStatus('Ready');
       } else {
         showToast(`Peer Error: ${err.type}`, 'error');
       }
@@ -218,15 +248,17 @@ export default function App() {
 
     peer.on('disconnected', () => {
       setCallStatus('Disconnected');
-      showToast('Disconnected from signaling server. Attempting to reconnect...', 'info');
+      setMyId(''); // Clear ID to show connecting state
+      console.log('Peer disconnected from signaling server.');
       
-      if (peerRef.current && !peerRef.current.destroyed) {
-        peerRef.current.reconnect();
+      if (!peer.destroyed) {
+        showToast('Disconnected from server. Reconnecting...', 'info');
+        peer.reconnect();
       }
 
       setTimeout(() => {
         if (peerRef.current && peerRef.current.disconnected && !peerRef.current.destroyed) {
-          console.log('Reconnection failed, re-initializing peer...');
+          console.log('Reconnection failed, performing full re-initialization...');
           initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
         }
       }, 10000);
@@ -260,9 +292,9 @@ export default function App() {
     conn.on('open', () => {
       showToast('Data channel connected', 'success');
     });
-    conn.on('data', (raw: any) => {
+    conn.on('data', (data: any) => {
       try {
-        const msg = JSON.parse(raw as string);
+        const msg = typeof data === 'string' ? JSON.parse(data) : data;
         if (msg.type === 'chat') {
           const receivedMsg = { ...msg.data, isMine: false };
           setMessages(prev => [...prev, receivedMsg]);
@@ -367,6 +399,10 @@ export default function App() {
 
   // --- Call Logic ---
   const startCall = async (targetId: string) => {
+    if (!peerRef.current || peerRef.current.disconnected) {
+      showToast('Signaling connection not ready. Please wait.', 'error');
+      return;
+    }
     if (!targetId || targetId.length !== 4) {
       showToast('Enter a valid 4-digit ID', 'error');
       return;
@@ -622,6 +658,55 @@ export default function App() {
   }, [messages]);
 
   // --- Whiteboard Logic ---
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const resizeCanvas = () => {
+      const parent = canvas.parentElement;
+      if (parent) {
+        canvas.width = parent.clientWidth;
+        canvas.height = parent.clientHeight;
+        // Redraw background
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+      }
+    };
+
+    const resizeObserver = new ResizeObserver(resizeCanvas);
+    resizeObserver.observe(canvas.parentElement!);
+    resizeCanvas();
+
+    return () => resizeObserver.disconnect();
+  }, [activeTab]);
+
+  const getCoordinates = (e: any) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    
+    let clientX, clientY;
+    if (e.touches && e.touches.length > 0) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else {
+      clientX = e.clientX;
+      clientY = e.clientY;
+    }
+
+    // Account for potential scaling between CSS size and internal canvas size
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY
+    };
+  };
+
   const handleRemoteDraw = (data: DrawEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -654,9 +739,13 @@ export default function App() {
 
   const startWatchTogether = (url: string) => {
     if (!url.trim()) return;
+    if (!dataConnRef.current || !dataConnRef.current.open) {
+      showToast('Connection not ready. Please wait or try calling again.', 'error');
+      return;
+    }
     setYoutubeUrl(url);
     setIsWatchingTogether(true);
-    dataConnRef.current?.send(JSON.stringify({ type: 'watchTogether', data: url }));
+    dataConnRef.current.send(JSON.stringify({ type: 'watchTogether', data: url }));
     showToast('Watch Together started');
   };
 
@@ -864,15 +953,13 @@ export default function App() {
             <div className="flex items-center gap-2">
               <div className={cn("w-2 h-2 rounded-full", myId ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : "bg-slate-400")} />
               <span className="text-xs font-medium text-slate-500">{myId ? 'Online' : 'Connecting...'}</span>
-              {!myId && (
-                <button 
-                  onClick={() => initPeer(localStorage.getItem('vc_myid') || generate4DigitId())}
-                  className="p-1 hover:bg-slate-100 rounded-full transition-colors"
-                  title="Reconnect"
-                >
-                  <RefreshCw size={12} className="text-slate-400" />
-                </button>
-              )}
+              <button 
+                onClick={() => initPeer(localStorage.getItem('vc_myid') || generate4DigitId())}
+                className="p-1 hover:bg-slate-100 rounded-full transition-colors"
+                title="Reconnect"
+              >
+                <RefreshCw size={12} className={cn("text-slate-400", !myId && "animate-spin")} />
+              </button>
             </div>
             <button 
               onClick={() => setShowSettings(true)}
@@ -917,10 +1004,14 @@ export default function App() {
                         const val = (document.getElementById('dialer-input') as HTMLInputElement).value;
                         startCall(val);
                       }}
-                      className="w-full max-w-xs py-4 bg-brand-500 hover:bg-brand-600 text-white rounded-2xl font-bold text-lg shadow-lg shadow-brand-500/20 transition-all active:scale-95 flex items-center justify-center gap-3"
+                      disabled={!myId}
+                      className={cn(
+                        "w-full max-w-xs py-4 rounded-2xl font-bold text-lg shadow-lg transition-all active:scale-95 flex items-center justify-center gap-3",
+                        !myId ? "bg-slate-300 cursor-not-allowed text-slate-500" : "bg-brand-500 hover:bg-brand-600 text-white shadow-brand-500/20"
+                      )}
                     >
-                      <Phone size={24} />
-                      Start Video Call
+                      {myId ? <Phone size={24} /> : <RefreshCw size={24} className="animate-spin" />}
+                      {myId ? 'Start Video Call' : 'Connecting...'}
                     </button>
                   </div>
                 </div>
@@ -938,6 +1029,12 @@ export default function App() {
                         <button onClick={stopWatchTogether} className="text-xs font-bold text-rose-500 hover:text-rose-600">Stop</button>
                       )}
                     </div>
+                    {!isCallActive && (
+                      <div className="mb-4 p-3 bg-amber-50 border border-amber-100 rounded-xl text-[10px] text-amber-700 flex items-center gap-2">
+                        <Shield size={12} />
+                        Start a call first to use this feature.
+                      </div>
+                    )}
                     <p className="text-sm text-slate-500 mb-4">Sync YouTube videos with your peer in real-time.</p>
                     <div className="flex gap-2">
                       <input 
@@ -945,11 +1042,13 @@ export default function App() {
                         placeholder="YouTube Link..." 
                         value={youtubeUrl}
                         onChange={(e) => setYoutubeUrl(e.target.value)}
-                        className="flex-1 bg-bg-base border border-border-subtle rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-500 text-text-primary" 
+                        disabled={!isCallActive}
+                        className="flex-1 bg-bg-base border border-border-subtle rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-500 text-text-primary disabled:opacity-50" 
                       />
                       <button 
                         onClick={() => startWatchTogether(youtubeUrl)}
-                        className="p-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg transition-all"
+                        disabled={!isCallActive}
+                        className="p-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg transition-all disabled:bg-slate-300 disabled:cursor-not-allowed"
                       >
                         <Play size={18} />
                       </button>
@@ -1149,19 +1248,17 @@ export default function App() {
                 <div className="flex-1 bg-bg-surface rounded-3xl overflow-hidden shadow-sm border border-border-subtle cursor-crosshair relative">
                   <canvas 
                     ref={canvasRef}
-                    className="w-full h-full"
+                    className="w-full h-full touch-none"
                     onMouseDown={(e) => {
                       isDrawingRef.current = true;
-                      const rect = canvasRef.current!.getBoundingClientRect();
-                      lastPosRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+                      const { x, y } = getCoordinates(e);
+                      lastPosRef.current = { x, y };
                     }}
                     onMouseMove={(e) => {
                       if (!isDrawingRef.current) return;
                       const canvas = canvasRef.current!;
                       const ctx = canvas.getContext('2d')!;
-                      const rect = canvas.getBoundingClientRect();
-                      const x = e.clientX - rect.left;
-                      const y = e.clientY - rect.top;
+                      const { x, y } = getCoordinates(e);
  
                       ctx.beginPath();
                       ctx.moveTo(lastPosRef.current.x, lastPosRef.current.y);
@@ -1188,6 +1285,43 @@ export default function App() {
                     }}
                     onMouseUp={() => isDrawingRef.current = false}
                     onMouseLeave={() => isDrawingRef.current = false}
+                    onTouchStart={(e) => {
+                      if (e.cancelable) e.preventDefault();
+                      isDrawingRef.current = true;
+                      const { x, y } = getCoordinates(e);
+                      lastPosRef.current = { x, y };
+                    }}
+                    onTouchMove={(e) => {
+                      if (e.cancelable) e.preventDefault();
+                      if (!isDrawingRef.current) return;
+                      const canvas = canvasRef.current!;
+                      const ctx = canvas.getContext('2d')!;
+                      const { x, y } = getCoordinates(e);
+ 
+                      ctx.beginPath();
+                      ctx.moveTo(lastPosRef.current.x, lastPosRef.current.y);
+                      ctx.lineTo(x, y);
+                      ctx.strokeStyle = wbTool === 'erase' ? '#ffffff' : wbColor;
+                      ctx.lineWidth = wbSize;
+                      ctx.lineCap = 'round';
+                      ctx.lineJoin = 'round';
+                      ctx.stroke();
+ 
+                      dataConnRef.current?.send(JSON.stringify({
+                        type: 'draw',
+                        data: {
+                          x0: lastPosRef.current.x / canvas.width,
+                          y0: lastPosRef.current.y / canvas.height,
+                          x1: x / canvas.width,
+                          y1: y / canvas.height,
+                          color: wbTool === 'erase' ? '#ffffff' : wbColor,
+                          size: wbSize
+                        }
+                      }));
+ 
+                      lastPosRef.current = { x, y };
+                    }}
+                    onTouchEnd={() => isDrawingRef.current = false}
                   />
                   {!dataConnRef.current && (
                     <div className="absolute inset-0 bg-slate-100/10 backdrop-blur-[1px] flex items-center justify-center pointer-events-none">
@@ -1380,7 +1514,11 @@ export default function App() {
             )}
           >
             {/* Video Area */}
-            <div className="relative w-full h-full">
+            {!isMiniMode ? (
+              <div 
+                className="relative w-full h-full"
+                onClick={() => setShowControls(!showControls)}
+              >
               <div className={cn(
                 "w-full h-full transition-all duration-500",
                 isPinned ? "scale-95 opacity-50 blur-sm" : "scale-100 opacity-100"
@@ -1436,6 +1574,33 @@ export default function App() {
                 </button>
               </div>
 
+              {/* Watch Together Overlay (Full Screen Mode) */}
+              <AnimatePresence>
+                {isWatchFullScreen && isWatchingTogether && youtubeUrl && (
+                  <motion.div 
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.9 }}
+                    className="absolute inset-0 z-20 flex items-center justify-center p-4 md:p-12 bg-black/60 backdrop-blur-md"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <div className="relative w-full max-w-5xl aspect-video bg-black rounded-3xl overflow-hidden shadow-2xl border border-white/10">
+                      <iframe 
+                        width="100%" height="100%" 
+                        src={`https://www.youtube.com/embed/${youtubeUrl.split('v=')[1]?.split('&')[0] || youtubeUrl.split('/').pop()}`}
+                        frameBorder="0" allowFullScreen
+                      ></iframe>
+                      <button 
+                        onClick={() => setIsWatchFullScreen(false)}
+                        className="absolute top-4 right-4 p-2 bg-black/40 text-white rounded-full hover:bg-black/60 transition-colors"
+                      >
+                        <Minimize2 size={20} />
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
               {/* Floating Reactions */}
               <div className="absolute inset-0 pointer-events-none overflow-hidden">
                 <AnimatePresence>
@@ -1458,7 +1623,21 @@ export default function App() {
               {!isMiniMode && (
                 <div className="absolute top-0 left-0 right-0 p-8 bg-gradient-to-b from-black/40 to-transparent pointer-events-none flex justify-between items-start">
                   <div className="flex flex-col gap-1">
-                    <span className="text-xs font-bold text-white/80 uppercase tracking-widest">{callStatus}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-white/80 uppercase tracking-widest">{callStatus}</span>
+                      {(callStatus === 'Offline' || callStatus === 'Disconnected') && (
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
+                          }}
+                          className="p-1 bg-white/10 hover:bg-white/20 rounded-full transition-colors pointer-events-auto"
+                          title="Reconnect"
+                        >
+                          <RefreshCw size={10} className="text-white animate-spin" />
+                        </button>
+                      )}
+                    </div>
                     <span className="text-3xl font-mono font-medium text-white tracking-wider">{callTimer}</span>
                   </div>
                   <div className="flex gap-2 pointer-events-auto">
@@ -1555,12 +1734,20 @@ export default function App() {
                             <button onClick={() => startWatchTogether(youtubeUrl)} className="p-2 bg-brand-500 text-white rounded-lg"><Play size={16} /></button>
                           </div>
                           {isWatchingTogether && youtubeUrl && (
-                            <div className="aspect-video rounded-xl overflow-hidden bg-black">
+                            <div className="relative aspect-video rounded-xl overflow-hidden bg-black group">
                               <iframe 
                                 width="100%" height="100%" 
                                 src={`https://www.youtube.com/embed/${youtubeUrl.split('v=')[1]?.split('&')[0] || youtubeUrl.split('/').pop()}`}
                                 frameBorder="0" allowFullScreen
                               ></iframe>
+                              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center pointer-events-none">
+                                <button 
+                                  onClick={() => setIsWatchFullScreen(true)}
+                                  className="p-3 bg-white/20 backdrop-blur-md text-white rounded-full pointer-events-auto hover:bg-white/40 transition-all"
+                                >
+                                  <Maximize2 size={24} />
+                                </button>
+                              </div>
                             </div>
                           )}
                         </div>
@@ -1571,123 +1758,138 @@ export default function App() {
               </AnimatePresence>
 
               {/* Call Controls */}
-              {!isMiniMode ? (
-                <div className="absolute bottom-0 left-0 right-0 p-4 md:p-8 flex flex-col items-center gap-4 md:gap-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
-                  {/* Reaction Bar */}
-                  <div className="flex gap-1 md:gap-2 p-1.5 md:p-2 bg-white/10 backdrop-blur-xl rounded-2xl border border-white/10 overflow-x-auto max-w-[90vw] no-scrollbar">
-                    {['👍', '❤️', '😂', '😮', '😢', '🔥'].map(emoji => (
+              <AnimatePresence>
+                {!isMiniMode && showControls && (
+                  <motion.div 
+                    initial={{ y: 20, opacity: 0 }}
+                    animate={{ y: 0, opacity: 1 }}
+                    exit={{ y: 20, opacity: 0 }}
+                    className="absolute bottom-0 left-0 right-0 p-3 md:p-8 flex flex-col items-center gap-2 md:gap-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent z-40"
+                  >
+                    {/* Reaction Bar */}
+                    <div className="flex gap-1 md:gap-2 p-1.5 md:p-2 bg-white/10 backdrop-blur-xl rounded-2xl border border-white/10 overflow-x-auto max-w-[90vw] no-scrollbar">
+                      {['👍', '❤️', '😂', '😮', '😢', '🔥'].map(emoji => (
+                        <button 
+                          key={emoji}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            sendReaction(emoji);
+                          }}
+                          className="p-2 hover:bg-white/20 rounded-xl transition-all text-xl md:text-2xl active:scale-125 shrink-0"
+                        >
+                          {emoji}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div 
+                      className="flex flex-wrap justify-center items-center gap-2 md:gap-4"
+                      onClick={(e) => e.stopPropagation()}
+                    >
                       <button 
-                        key={emoji}
-                        onClick={() => sendReaction(emoji)}
-                        className="p-2 hover:bg-white/20 rounded-xl transition-all text-xl md:text-2xl active:scale-125 shrink-0"
+                        onClick={toggleMic}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                          isMuted ? "bg-rose-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
                       >
-                        {emoji}
+                        {isMuted ? <MicOff size={18} className="md:w-[22px] md:h-[22px]" /> : <Mic size={18} className="md:w-[22px] md:h-[22px]" />}
                       </button>
-                    ))}
-                  </div>
+                      <button 
+                        onClick={toggleCam}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                          isCamOff ? "bg-rose-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        {isCamOff ? <VideoOff size={18} className="md:w-[22px] md:h-[22px]" /> : <Video size={18} className="md:w-[22px] md:h-[22px]" />}
+                      </button>
+                      
+                      <button 
+                        onClick={toggleScreenShare}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg hidden sm:flex",
+                          isScreenSharing ? "bg-emerald-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        <MonitorUp size={18} className="md:w-[22px] md:h-[22px]" />
+                      </button>
 
-                  <div className="flex flex-wrap justify-center items-center gap-3 md:gap-4">
-                    <button 
-                      onClick={toggleMic}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isMuted ? "bg-rose-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
-                    </button>
-                    <button 
-                      onClick={toggleCam}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isCamOff ? "bg-rose-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      {isCamOff ? <VideoOff size={22} /> : <Video size={22} />}
-                    </button>
-                    
-                    <button 
-                      onClick={toggleScreenShare}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isScreenSharing ? "bg-emerald-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      <MonitorUp size={22} />
-                    </button>
+                      <button 
+                        onClick={toggleHandRaise}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                          isHandRaised ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        <Hand size={18} className="md:w-[22px] md:h-[22px]" />
+                      </button>
 
-                    <button 
-                      onClick={toggleHandRaise}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isHandRaised ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      <Hand size={22} />
-                    </button>
+                      <button 
+                        onClick={toggleRecording}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg hidden sm:flex",
+                          isRecording ? "bg-rose-500 text-white animate-pulse" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        {isRecording ? <CircleStop size={18} className="md:w-[22px] md:h-[22px]" /> : <Download size={18} className="md:w-[22px] md:h-[22px]" />}
+                      </button>
 
-                    <button 
-                      onClick={toggleRecording}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isRecording ? "bg-rose-500 text-white animate-pulse" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      {isRecording ? <CircleStop size={22} /> : <Download size={22} />}
-                    </button>
+                      <button 
+                        onClick={() => setIsBlurEnabled(!isBlurEnabled)}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                          isBlurEnabled ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        <Palette size={18} className="md:w-[22px] md:h-[22px]" />
+                      </button>
 
-                    <button 
-                      onClick={() => setIsBlurEnabled(!isBlurEnabled)}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isBlurEnabled ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      <Palette size={22} />
-                    </button>
+                      <button 
+                        onClick={() => {
+                          setIsSidePanelOpen(!isSidePanelOpen);
+                          if (!isSidePanelOpen) setSidePanelTab('chat');
+                        }}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                          isSidePanelOpen && sidePanelTab === 'chat' ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        <MessageSquare size={18} className="md:w-[22px] md:h-[22px]" />
+                      </button>
 
-                    <button 
-                      onClick={() => {
-                        setIsSidePanelOpen(!isSidePanelOpen);
-                        if (!isSidePanelOpen) setSidePanelTab('chat');
-                      }}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isSidePanelOpen && sidePanelTab === 'chat' ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      <MessageSquare size={22} />
-                    </button>
+                      <button 
+                        onClick={() => {
+                          setIsSidePanelOpen(!isSidePanelOpen);
+                          if (!isSidePanelOpen) setSidePanelTab('watch');
+                        }}
+                        className={cn(
+                          "p-2.5 md:p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                          isSidePanelOpen && sidePanelTab === 'watch' ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                        )}
+                      >
+                        <Monitor size={18} className="md:w-[22px] md:h-[22px]" />
+                      </button>
 
-                    <button 
-                      onClick={() => {
-                        setIsSidePanelOpen(!isSidePanelOpen);
-                        if (!isSidePanelOpen) setSidePanelTab('watch');
-                      }}
-                      className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
-                        isSidePanelOpen && sidePanelTab === 'watch' ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
-                      )}
-                    >
-                      <Monitor size={22} />
-                    </button>
-
-                    <button 
-                      onClick={endCall}
-                      className="p-5 bg-rose-500 hover:bg-rose-600 text-white rounded-full shadow-xl shadow-rose-500/40 transition-all active:scale-90"
-                    >
-                      <PhoneOff size={28} />
-                    </button>
-                    
-                    <button 
-                      onClick={() => setIsMiniMode(true)}
-                      className="p-4 bg-white/10 text-white hover:bg-white/20 rounded-full backdrop-blur-md transition-all shadow-lg"
-                    >
-                      <Minimize2 size={22} />
-                    </button>
-                  </div>
-                </div>
-              ) : (
+                      <button 
+                        onClick={endCall}
+                        className="p-4 md:p-5 bg-rose-500 hover:bg-rose-600 text-white rounded-full shadow-xl shadow-rose-500/40 transition-all active:scale-90"
+                      >
+                        <PhoneOff size={24} className="md:w-[28px] md:h-[28px]" />
+                      </button>
+                      
+                      <button 
+                        onClick={() => setIsMiniMode(true)}
+                        className="p-3 md:p-4 bg-white/10 text-white hover:bg-white/20 rounded-full backdrop-blur-md transition-all shadow-lg hidden md:flex"
+                      >
+                        <Minimize2 size={20} className="md:w-[22px] md:h-[22px]" />
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          ) : (
                 <div className="absolute inset-0 group cursor-pointer" onClick={() => setIsMiniMode(false)}>
                   <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
                     <Maximize2 className="text-white" size={32} />
@@ -1703,8 +1905,7 @@ export default function App() {
                   </button>
                 </div>
               )}
-            </div>
-          </motion.div>
+            </motion.div>
         )}
       </AnimatePresence>
 
