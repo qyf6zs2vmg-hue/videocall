@@ -1,0 +1,5 @@
+{
+  "name": "VideoCall Pro",
+  "description": "A professional, modern video calling application with real-time chat, whiteboard, and translation features.",
+  "requestFramePermissions": ["camera", "microphone"]
+}
