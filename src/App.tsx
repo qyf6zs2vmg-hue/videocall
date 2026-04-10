@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import Peer, { MediaConnection, DataConnection } from 'peerjs';
+import { GoogleGenAI } from "@google/genai";
 import { 
   Video, 
   Mic, 
@@ -38,8 +39,11 @@ import {
   Volume2,
   Camera,
   Mic2,
-  Sun,
-  Moon
+  RefreshCw,
+  Shield,
+  Zap,
+  Globe,
+  Rocket
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
@@ -120,13 +124,19 @@ export default function App() {
   const [showAddContact, setShowAddContact] = useState(false);
   const [newContactName, setNewContactName] = useState('');
   const [newContactId, setNewContactId] = useState('');
-  const [isDark, setIsDark] = useState(() => {
+  const [showWelcome, setShowWelcome] = useState(() => {
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('vc_theme');
-      return saved ? saved === 'dark' : true;
+      return !localStorage.getItem('vc_visited');
     }
-    return true;
+    return false;
   });
+  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [isWatchingTogether, setIsWatchingTogether] = useState(false);
+  const [summary, setSummary] = useState('');
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+
+  const [isSidePanelOpen, setIsSidePanelOpen] = useState(false);
+  const [sidePanelTab, setSidePanelTab] = useState<'chat' | 'watch'>('chat');
 
   // --- Refs ---
   const peerRef = useRef<Peer | null>(null);
@@ -155,76 +165,76 @@ export default function App() {
     setTimeout(() => setToast(null), 3000);
   }, []);
 
-  // --- Theme Effect ---
-  useEffect(() => {
-    if (isDark) {
-      document.documentElement.classList.add('dark');
-      localStorage.setItem('vc_theme', 'dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-      localStorage.setItem('vc_theme', 'light');
-    }
-  }, [isDark]);
-
   // --- PeerJS Initialization ---
-  useEffect(() => {
-    const savedId = localStorage.getItem('vc_myid') || generate4DigitId();
-    
-    const initPeer = (id: string) => {
-      // Clean up previous instance if it exists
-      if (peerRef.current) {
-        peerRef.current.destroy();
+  const initPeer = useCallback((id: string) => {
+    // Clean up previous instance if it exists
+    if (peerRef.current) {
+      peerRef.current.destroy();
+    }
+
+    const peer = new Peer(id);
+    peerRef.current = peer;
+
+    peer.on('open', (assigned) => {
+      setMyId(assigned);
+      localStorage.setItem('vc_myid', assigned);
+      showToast(`Connected with ID: ${assigned}`, 'success');
+    });
+
+    peer.on('error', (err) => {
+      console.error('[PeerJS Error]', err);
+      
+      if (err.type === 'unavailable-id') {
+        const newId = generate4DigitId();
+        setTimeout(() => {
+          initPeer(newId);
+          showToast('ID was taken, assigned a new one', 'info');
+        }, 500);
+      } else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+        setCallStatus('Offline');
+        showToast('Connection lost. Retrying...', 'error');
+        
+        setTimeout(() => {
+          if (peerRef.current && !peerRef.current.destroyed) {
+            if (peerRef.current.disconnected) {
+              peerRef.current.reconnect();
+            }
+          } else {
+            initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
+          }
+        }, 5000);
+      } else {
+        showToast(`Peer Error: ${err.type}`, 'error');
+      }
+    });
+
+    peer.on('call', (call) => {
+      setIncomingCall(call);
+    });
+
+    peer.on('connection', (conn) => {
+      setupDataConnection(conn);
+    });
+
+    peer.on('disconnected', () => {
+      setCallStatus('Disconnected');
+      showToast('Disconnected from signaling server. Attempting to reconnect...', 'info');
+      
+      if (peerRef.current && !peerRef.current.destroyed) {
+        peerRef.current.reconnect();
       }
 
-      const peer = new Peer(id);
-      peerRef.current = peer;
-
-      peer.on('open', (assigned) => {
-        setMyId(assigned);
-        localStorage.setItem('vc_myid', assigned);
-        showToast(`Connected with ID: ${assigned}`, 'success');
-      });
-
-      peer.on('error', (err) => {
-        console.error('[PeerJS Error]', err);
-        
-        if (err.type === 'unavailable-id') {
-          const newId = generate4DigitId();
-          // Silently try a new ID if the generated one is taken
-          setTimeout(() => {
-            initPeer(newId);
-            showToast('ID was taken, assigned a new one', 'info');
-          }, 500);
-        } else if (err.type === 'network' || err.type === 'server-error') {
-          showToast('Connection lost. Retrying...', 'error');
-          // Attempt to reconnect after a delay
-          setTimeout(() => {
-            if (peer.disconnected && !peer.destroyed) {
-              peer.reconnect();
-            } else if (peer.destroyed) {
-              initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
-            }
-          }, 3000);
-        } else {
-          showToast(`Peer Error: ${err.type}`, 'error');
+      setTimeout(() => {
+        if (peerRef.current && peerRef.current.disconnected && !peerRef.current.destroyed) {
+          console.log('Reconnection failed, re-initializing peer...');
+          initPeer(localStorage.getItem('vc_myid') || generate4DigitId());
         }
-      });
+      }, 10000);
+    });
+  }, [showToast]);
 
-      peer.on('call', (call) => {
-        setIncomingCall(call);
-      });
-
-      peer.on('connection', (conn) => {
-        setupDataConnection(conn);
-      });
-
-      peer.on('disconnected', () => {
-        setCallStatus('Disconnected');
-        showToast('Disconnected from server. Reconnecting...', 'info');
-        peer.reconnect();
-      });
-    };
-
+  useEffect(() => {
+    const savedId = localStorage.getItem('vc_myid') || generate4DigitId();
     initPeer(savedId);
 
     // Check for invite link
@@ -243,7 +253,7 @@ export default function App() {
         peerRef.current.destroy();
       }
     };
-  }, [showToast]);
+  }, [initPeer, showToast]);
 
   const setupDataConnection = (conn: DataConnection) => {
     dataConnRef.current = conn;
@@ -270,6 +280,13 @@ export default function App() {
           if (msg.data) showToast('Peer raised their hand ✋');
         } else if (msg.type === 'reaction') {
           addReaction(msg.data);
+        } else if (msg.type === 'watchTogether') {
+          setYoutubeUrl(msg.data);
+          setIsWatchingTogether(true);
+          showToast('Peer started Watch Together 🍿');
+        } else if (msg.type === 'stopWatch') {
+          setIsWatchingTogether(false);
+          showToast('Watch Together ended');
         }
       } catch (e) {
         console.error('Data parse error', e);
@@ -334,6 +351,20 @@ export default function App() {
     };
   }, [isCallActive]);
 
+  // --- Stream Assignment Effect ---
+  useEffect(() => {
+    if (isCallActive) {
+      // Small delay to ensure refs are populated after render
+      const timer = setTimeout(() => {
+        if (localVideoRef.current && localStreamRef.current) {
+          localVideoRef.current.srcObject = localStreamRef.current;
+        }
+        // We might need to store remote stream in a ref too if it's lost
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [isCallActive]);
+
   // --- Call Logic ---
   const startCall = async (targetId: string) => {
     if (!targetId || targetId.length !== 4) {
@@ -369,7 +400,16 @@ export default function App() {
   const setupCall = (call: MediaConnection) => {
     currentCallRef.current = call;
     call.on('stream', (remoteStream) => {
-      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = remoteStream;
+      // Store remote stream in a ref or state if needed, but for now we try to assign it
+      const assignRemote = () => {
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStream;
+        } else {
+          setTimeout(assignRemote, 100);
+        }
+      };
+      assignRemote();
+      
       setCallStatus('Connected');
       startTimer();
       showToast('Peer joined the call', 'success');
@@ -612,6 +652,45 @@ export default function App() {
     dataConnRef.current?.send(JSON.stringify({ type: 'wbClear' }));
   };
 
+  const startWatchTogether = (url: string) => {
+    if (!url.trim()) return;
+    setYoutubeUrl(url);
+    setIsWatchingTogether(true);
+    dataConnRef.current?.send(JSON.stringify({ type: 'watchTogether', data: url }));
+    showToast('Watch Together started');
+  };
+
+  const stopWatchTogether = () => {
+    setIsWatchingTogether(false);
+    dataConnRef.current?.send(JSON.stringify({ type: 'stopWatch' }));
+    showToast('Watch Together stopped');
+  };
+
+  const generateSummary = async () => {
+    if (messages.length === 0) {
+      showToast('No messages to summarize', 'info');
+      return;
+    }
+    setIsGeneratingSummary(true);
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+      const chatHistory = messages.map(m => `${m.from}: ${m.text}`).join('\n');
+      
+      const response = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: `Summarize this chat conversation briefly and highlight key points in a bulleted list:\n\n${chatHistory}`,
+      });
+      
+      setSummary(response.text || 'No summary generated.');
+      showToast('Summary generated!', 'success');
+    } catch (e) {
+      console.error('Summary error', e);
+      showToast('Failed to generate summary', 'error');
+    } finally {
+      setIsGeneratingSummary(false);
+    }
+  };
+
   // --- UI Components ---
   const SidebarItem = ({ id, icon: Icon, label, badge }: { id: Tab; icon: any; label: string; badge?: number }) => {
     const isActive = activeTab === id;
@@ -642,15 +721,104 @@ export default function App() {
         {isActive && (
           <motion.div 
             layoutId="activeTab"
-            className="absolute left-0 w-1 h-8 bg-brand-500 rounded-r-full"
+            className="absolute bg-brand-500 rounded-full md:left-0 md:w-1 md:h-8 md:rounded-r-full bottom-0 w-8 h-1 md:bottom-auto"
           />
         )}
       </button>
     );
   };
 
+  const closeWelcome = () => {
+    setShowWelcome(false);
+    localStorage.setItem('vc_visited', 'true');
+  };
+
   return (
     <div className="flex h-screen overflow-hidden select-none bg-bg-base">
+      {/* Welcome Modal */}
+      <AnimatePresence>
+        {showWelcome && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[2000] flex items-center justify-center p-4 md:p-6 bg-slate-950/60 backdrop-blur-xl"
+          >
+            <motion.div 
+              initial={{ scale: 0.9, y: 20, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.9, y: 20, opacity: 0 }}
+              className="bg-bg-surface w-full max-w-2xl rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col md:flex-row border border-border-subtle"
+            >
+              <div className="w-full md:w-2/5 bg-brand-500 p-8 md:p-12 flex flex-col justify-between text-white relative overflow-hidden">
+                <div className="absolute top-0 right-0 -mr-16 -mt-16 w-64 h-64 bg-white/10 rounded-full blur-3xl"></div>
+                <div className="absolute bottom-0 left-0 -ml-16 -mb-16 w-64 h-64 bg-brand-400/20 rounded-full blur-3xl"></div>
+                
+                <div className="relative z-10">
+                  <div className="w-16 h-16 bg-white/20 backdrop-blur-md rounded-2xl flex items-center justify-center mb-6 shadow-xl">
+                    <Rocket size={32} className="text-white" />
+                  </div>
+                  <h2 className="text-4xl font-bold leading-tight mb-4">Welcome to VC Pro</h2>
+                  <p className="text-brand-50 text-lg font-medium opacity-90">The future of peer-to-peer communication.</p>
+                </div>
+
+                <div className="relative z-10 mt-8">
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
+                    <span className="text-xs font-bold uppercase tracking-widest text-brand-100">Direct & Secure</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="w-full md:w-3/5 p-8 md:p-12 flex flex-col justify-between bg-bg-surface">
+                <div className="space-y-6">
+                  <h3 className="text-xl font-bold text-text-primary">Why choose us?</h3>
+                  
+                  <div className="grid gap-6">
+                    <div className="flex gap-4">
+                      <div className="shrink-0 w-10 h-10 bg-brand-50 text-brand-500 rounded-xl flex items-center justify-center">
+                        <Zap size={20} />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-sm text-text-primary">Instant Connection</h4>
+                        <p className="text-xs text-text-secondary mt-1">No accounts, no links. Just a 4-digit ID and you're in.</p>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-4">
+                      <div className="shrink-0 w-10 h-10 bg-emerald-50 text-emerald-500 rounded-xl flex items-center justify-center">
+                        <Shield size={20} />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-sm text-text-primary">Private by Design</h4>
+                        <p className="text-xs text-text-secondary mt-1">Direct peer-to-peer streams. Your data never touches our servers.</p>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-4">
+                      <div className="shrink-0 w-10 h-10 bg-indigo-50 text-indigo-500 rounded-xl flex items-center justify-center">
+                        <Sparkles size={20} />
+                      </div>
+                      <div>
+                        <h4 className="font-bold text-sm text-text-primary">Smart Features</h4>
+                        <p className="text-xs text-text-secondary mt-1">AI summaries, real-time translation, and interactive whiteboard.</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <button 
+                  onClick={closeWelcome}
+                  className="mt-10 w-full py-4 bg-brand-500 hover:bg-brand-600 text-white rounded-2xl font-bold text-lg shadow-lg shadow-brand-500/20 transition-all active:scale-95"
+                >
+                  Get Started
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Sidebar (Desktop) / Bottom Nav (Mobile) */}
       <aside className="hidden md:flex flex-col w-20 bg-bg-surface border-r border-border-subtle z-20">
         <div className="flex items-center justify-center h-20">
@@ -673,41 +841,38 @@ export default function App() {
       </aside>
 
       {/* Main Content Area */}
-      <main className="flex-1 flex flex-col relative min-w-0">
+      <main className="flex-1 flex flex-col relative min-w-0 pb-16 md:pb-0">
         {/* Header */}
         <header className="h-16 flex items-center justify-between px-6 bg-bg-surface border-b border-border-subtle backdrop-blur-md z-10">
           <div className="flex items-center gap-3">
-            <h1 className="text-lg font-bold tracking-tight text-text-primary md:hidden">VideoCall Pro</h1>
-            <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-slate-100 border border-border-subtle rounded-lg">
-              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Your ID</span>
-              <span className="font-mono text-brand-500 font-bold tracking-widest">{myId || '----'}</span>
-              <button 
-                onClick={() => {
+            <h1 className="text-lg font-bold tracking-tight text-text-primary md:hidden">VC</h1>
+            <button 
+              onClick={() => {
+                if (myId) {
                   navigator.clipboard.writeText(myId);
                   showToast('ID copied to clipboard', 'success');
-                }}
-                className="ml-2 text-slate-400 hover:text-slate-600"
-                title="Copy ID"
-              >
-                <Copy size={14} />
-              </button>
-              <button 
-                onClick={() => {
-                  const url = `${window.location.origin}?call=${myId}`;
-                  navigator.clipboard.writeText(url);
-                  showToast('Invite link copied!', 'success');
-                }}
-                className="ml-1 text-slate-400 hover:text-slate-600"
-                title="Copy Invite Link"
-              >
-                <Plus size={14} />
-              </button>
-            </div>
+                }
+              }}
+              className="flex items-center gap-2 px-2 md:px-3 py-1 md:py-1.5 bg-brand-50 border border-brand-100 rounded-xl hover:bg-brand-100 transition-colors group"
+            >
+              <span className="hidden sm:inline text-[10px] font-bold text-brand-400 uppercase tracking-widest group-hover:text-brand-500 transition-colors">My ID</span>
+              <span className="font-mono text-brand-600 font-bold tracking-widest text-xs md:text-sm">{myId || '----'}</span>
+              <Copy size={12} className="text-brand-400 group-hover:text-brand-600 transition-colors md:w-3.5 md:h-3.5" />
+            </button>
           </div>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
               <div className={cn("w-2 h-2 rounded-full", myId ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]" : "bg-slate-400")} />
               <span className="text-xs font-medium text-slate-500">{myId ? 'Online' : 'Connecting...'}</span>
+              {!myId && (
+                <button 
+                  onClick={() => initPeer(localStorage.getItem('vc_myid') || generate4DigitId())}
+                  className="p-1 hover:bg-slate-100 rounded-full transition-colors"
+                  title="Reconnect"
+                >
+                  <RefreshCw size={12} className="text-slate-400" />
+                </button>
+              )}
             </div>
             <button 
               onClick={() => setShowSettings(true)}
@@ -761,29 +926,73 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="bg-bg-surface border border-border-subtle rounded-3xl p-6 hover:shadow-md transition-all">
-                    <div className="flex items-center gap-4 mb-4">
-                      <div className="p-3 bg-indigo-500/10 text-indigo-500 rounded-xl">
-                        <Monitor size={24} />
+                  <div className="bg-bg-surface border border-border-subtle rounded-3xl p-6 hover:shadow-md transition-all">
+                    <div className="flex items-center justify-between mb-4">
+                      <div className="flex items-center gap-4">
+                        <div className="p-3 bg-indigo-500/10 text-indigo-500 rounded-xl">
+                          <Monitor size={24} />
+                        </div>
+                        <h3 className="font-bold text-text-primary">Watch Together</h3>
                       </div>
-                      <h3 className="font-bold text-text-primary">Watch Together</h3>
+                      {isWatchingTogether && (
+                        <button onClick={stopWatchTogether} className="text-xs font-bold text-rose-500 hover:text-rose-600">Stop</button>
+                      )}
                     </div>
                     <p className="text-sm text-slate-500 mb-4">Sync YouTube videos with your peer in real-time.</p>
                     <div className="flex gap-2">
-                      <input type="text" placeholder="YouTube Link..." className="flex-1 bg-bg-base border border-border-subtle rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-500 text-text-primary" />
-                      <button className="p-2 bg-slate-100 hover:bg-slate-200 rounded-lg text-slate-600"><Play size={18} /></button>
+                      <input 
+                        type="text" 
+                        placeholder="YouTube Link..." 
+                        value={youtubeUrl}
+                        onChange={(e) => setYoutubeUrl(e.target.value)}
+                        className="flex-1 bg-bg-base border border-border-subtle rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-500 text-text-primary" 
+                      />
+                      <button 
+                        onClick={() => startWatchTogether(youtubeUrl)}
+                        className="p-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg transition-all"
+                      >
+                        <Play size={18} />
+                      </button>
                     </div>
+                    {isWatchingTogether && youtubeUrl && (
+                      <div className="mt-4 aspect-video rounded-xl overflow-hidden bg-black border border-border-subtle">
+                        <iframe 
+                          width="100%" 
+                          height="100%" 
+                          src={`https://www.youtube.com/embed/${youtubeUrl.split('v=')[1]?.split('&')[0] || youtubeUrl.split('/').pop()}`}
+                          title="YouTube video player" 
+                          frameBorder="0" 
+                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
+                          allowFullScreen
+                        ></iframe>
+                      </div>
+                    )}
                   </div>
-                  <div className="bg-bg-surface border border-border-subtle rounded-2xl p-6 hover:shadow-md transition-all">
+                  <div className="bg-bg-surface border border-border-subtle rounded-3xl p-6 hover:shadow-md transition-all flex flex-col">
                     <div className="flex items-center gap-4 mb-4">
                       <div className="p-3 bg-emerald-500/10 text-emerald-500 rounded-xl">
                         <Sparkles size={24} />
                       </div>
                       <h3 className="font-bold text-text-primary">AI Summary</h3>
                     </div>
-                    <p className="text-sm text-slate-500 mb-4">Get a quick recap of your chat history using Claude AI.</p>
-                    <button className="text-sm font-bold text-brand-500 hover:text-brand-600 flex items-center gap-1">
-                      Learn more <ChevronRight size={14} />
+                    <p className="text-sm text-slate-500 mb-4">Get a quick recap of your chat history using Gemini AI.</p>
+                    
+                    {summary ? (
+                      <div className="flex-1 bg-bg-base border border-border-subtle rounded-xl p-4 text-xs text-text-secondary overflow-y-auto max-h-40 mb-4">
+                        {summary}
+                      </div>
+                    ) : null}
+
+                    <button 
+                      onClick={generateSummary}
+                      disabled={isGeneratingSummary}
+                      className={cn(
+                        "mt-auto w-full py-2.5 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2",
+                        isGeneratingSummary ? "bg-slate-100 text-slate-400 cursor-not-allowed" : "bg-brand-500/10 text-brand-600 hover:bg-brand-500 hover:text-white"
+                      )}
+                    >
+                      {isGeneratingSummary ? 'Generating...' : 'Generate Summary'}
+                      {!isGeneratingSummary && <ChevronRight size={16} />}
                     </button>
                   </div>
                 </div>
@@ -889,21 +1098,21 @@ export default function App() {
                 exit={{ opacity: 0 }}
                 className="h-full flex flex-col gap-4"
               >
-                <div className="flex flex-wrap items-center justify-between gap-4 p-4 bg-bg-surface dark:bg-bg-surface border border-border-subtle dark:border-border-subtle rounded-2xl shadow-sm">
+                <div className="flex flex-wrap items-center justify-between gap-4 p-4 bg-bg-surface border border-border-subtle rounded-2xl shadow-sm">
                   <div className="flex items-center gap-2">
                     <button 
                       onClick={() => setWbTool('draw')}
-                      className={cn("p-2 rounded-lg transition-colors", wbTool === 'draw' ? "bg-brand-500 text-white" : "text-slate-500 dark:text-text-secondary hover:bg-slate-100 dark:hover:bg-bg-elevated")}
+                      className={cn("p-2 rounded-lg transition-colors", wbTool === 'draw' ? "bg-brand-500 text-white" : "text-slate-500 hover:bg-slate-100")}
                     >
                       <PenTool size={20} />
                     </button>
                     <button 
                       onClick={() => setWbTool('erase')}
-                      className={cn("p-2 rounded-lg transition-colors", wbTool === 'erase' ? "bg-brand-500 text-white" : "text-slate-500 dark:text-text-secondary hover:bg-slate-100 dark:hover:bg-bg-elevated")}
+                      className={cn("p-2 rounded-lg transition-colors", wbTool === 'erase' ? "bg-brand-500 text-white" : "text-slate-500 hover:bg-slate-100")}
                     >
                       <Eraser size={20} />
                     </button>
-                    <div className="w-px h-6 bg-slate-200 dark:bg-border-subtle mx-2" />
+                    <div className="w-px h-6 bg-slate-200 mx-2" />
                     <div className="flex items-center gap-1.5">
                       {['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#111b21'].map(color => (
                         <button 
@@ -911,7 +1120,7 @@ export default function App() {
                           onClick={() => setWbColor(color)}
                           className={cn(
                             "w-6 h-6 rounded-full border-2 transition-transform",
-                            wbColor === color ? "border-slate-400 dark:border-[#e9edef] scale-110" : "border-transparent hover:scale-105"
+                            wbColor === color ? "border-slate-400 scale-110" : "border-transparent hover:scale-105"
                           )}
                           style={{ backgroundColor: color }}
                         />
@@ -931,13 +1140,13 @@ export default function App() {
                     </div>
                     <button 
                       onClick={clearCanvas}
-                      className="px-3 py-1.5 bg-slate-100 dark:bg-bg-elevated hover:bg-rose-500/10 hover:text-rose-500 text-slate-500 dark:text-text-secondary rounded-lg text-xs font-bold transition-all"
+                      className="px-3 py-1.5 bg-slate-100 hover:bg-rose-500/10 hover:text-rose-500 text-slate-500 rounded-lg text-xs font-bold transition-all"
                     >
                       Clear All
                     </button>
                   </div>
                 </div>
-                <div className="flex-1 bg-bg-surface dark:bg-bg-surface rounded-3xl overflow-hidden shadow-sm border border-border-subtle dark:border-border-subtle cursor-crosshair relative">
+                <div className="flex-1 bg-bg-surface rounded-3xl overflow-hidden shadow-sm border border-border-subtle cursor-crosshair relative">
                   <canvas 
                     ref={canvasRef}
                     className="w-full h-full"
@@ -982,8 +1191,8 @@ export default function App() {
                   />
                   {!dataConnRef.current && (
                     <div className="absolute inset-0 bg-slate-100/10 backdrop-blur-[1px] flex items-center justify-center pointer-events-none">
-                      <div className="bg-bg-surface/90 dark:bg-bg-surface/90 border border-border-subtle dark:border-border-subtle px-4 py-2 rounded-full shadow-sm">
-                        <p className="text-xs font-bold text-slate-500 dark:text-text-secondary">Connect to a peer to sync whiteboard</p>
+                      <div className="bg-bg-surface/90 border border-border-subtle px-4 py-2 rounded-full shadow-sm">
+                        <p className="text-xs font-bold text-slate-500">Connect to a peer to sync whiteboard</p>
                       </div>
                     </div>
                   )}
@@ -1000,7 +1209,7 @@ export default function App() {
                 className="max-w-4xl mx-auto space-y-6"
               >
                 <div className="flex items-center justify-between">
-                  <h2 className="text-2xl font-bold text-text-primary dark:text-text-primary">Saved Peers</h2>
+                  <h2 className="text-2xl font-bold text-text-primary">Saved Peers</h2>
                   <button 
                     onClick={() => setShowAddContact(true)}
                     className="flex items-center gap-2 px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white rounded-xl font-bold text-sm transition-all shadow-md"
@@ -1011,26 +1220,26 @@ export default function App() {
 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {contacts.length === 0 ? (
-                    <div className="col-span-full py-20 text-center space-y-4 bg-bg-surface dark:bg-bg-surface border border-dashed border-border-subtle dark:border-border-subtle rounded-3xl">
-                      <Users size={48} className="mx-auto text-slate-300 dark:text-slate-700" />
+                    <div className="col-span-full py-20 text-center space-y-4 bg-bg-surface border border-dashed border-border-subtle rounded-3xl">
+                      <Users size={48} className="mx-auto text-slate-300" />
                       <p className="text-slate-500">No peers saved yet. Add your friends to call them easily.</p>
                     </div>
                   ) : (
                     contacts.map((contact, idx) => (
-                      <div key={idx} className="bg-bg-surface dark:bg-bg-surface border border-border-subtle dark:border-border-subtle p-4 rounded-2xl flex items-center justify-between group hover:shadow-md transition-all">
+                      <div key={idx} className="bg-bg-surface border border-border-subtle p-4 rounded-2xl flex items-center justify-between group hover:shadow-md transition-all">
                         <div className="flex items-center gap-4">
-                          <div className="w-12 h-12 rounded-full bg-bg-base dark:bg-bg-base flex items-center justify-center text-lg font-bold text-slate-500 dark:text-text-secondary group-hover:bg-brand-500/10 group-hover:text-brand-500 transition-colors">
+                          <div className="w-12 h-12 rounded-full bg-bg-base flex items-center justify-center text-lg font-bold text-slate-500 group-hover:bg-brand-500/10 group-hover:text-brand-500 transition-colors">
                             {contact.name[0].toUpperCase()}
                           </div>
                           <div>
-                            <h4 className="font-bold text-text-primary dark:text-text-primary">{contact.name}</h4>
+                            <h4 className="font-bold text-text-primary">{contact.name}</h4>
                             <p className="font-mono text-xs text-slate-500 tracking-widest">{contact.id}</p>
                           </div>
                         </div>
                         <div className="flex items-center gap-2">
                           <button 
                             onClick={() => startCall(contact.id)}
-                            className="p-2.5 bg-emerald-500/10 text-emerald-600 dark:text-emerald-500 hover:bg-emerald-500 hover:text-white rounded-xl transition-all"
+                            className="p-2.5 bg-emerald-500/10 text-emerald-600 hover:bg-emerald-500 hover:text-white rounded-xl transition-all"
                           >
                             <Phone size={18} />
                           </button>
@@ -1040,7 +1249,7 @@ export default function App() {
                               setContacts(newContacts);
                               localStorage.setItem('vc_contacts', JSON.stringify(newContacts));
                             }}
-                            className="p-2.5 bg-rose-500/10 text-rose-600 dark:text-rose-500 hover:bg-rose-500 hover:text-white rounded-xl transition-all"
+                            className="p-2.5 bg-rose-500/10 text-rose-600 hover:bg-rose-500 hover:text-white rounded-xl transition-all"
                           >
                             <Trash2 size={18} />
                           </button>
@@ -1106,7 +1315,7 @@ export default function App() {
       </main>
 
       {/* Mobile Bottom Nav */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-bg-surface dark:bg-bg-surface border-t border-border-subtle dark:border-border-subtle flex items-center justify-around z-20">
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-bg-surface border-t border-border-subtle flex items-center justify-around z-20">
         <SidebarItem id="calls" icon={Phone} label="Calls" />
         <SidebarItem id="chat" icon={MessageSquare} label="Chat" badge={unreadCount} />
         <SidebarItem id="board" icon={PenTool} label="Board" />
@@ -1127,7 +1336,7 @@ export default function App() {
             <motion.div 
               initial={{ scale: 0.9, y: 20 }}
               animate={{ scale: 1, y: 0 }}
-              className="bg-bg-surface dark:bg-bg-surface border border-border-subtle dark:border-border-subtle rounded-[2.5rem] p-10 max-w-sm w-full text-center shadow-2xl"
+              className="bg-bg-surface border border-border-subtle rounded-[2.5rem] p-10 max-w-sm w-full text-center shadow-2xl"
             >
               <div className="relative mx-auto w-24 h-24 mb-6">
                 <div className="absolute inset-0 bg-emerald-500 rounded-full animate-ping opacity-20"></div>
@@ -1135,7 +1344,7 @@ export default function App() {
                   <Phone className="text-white" size={40} />
                 </div>
               </div>
-              <h2 className="text-2xl font-bold text-text-primary dark:text-text-primary mb-2">Incoming Call</h2>
+              <h2 className="text-2xl font-bold text-text-primary mb-2">Incoming Call</h2>
               <p className="text-slate-500 mb-8">Peer <span className="font-mono font-bold text-brand-500">{incomingCall.peer}</span> is calling you.</p>
               <div className="flex gap-4">
                 <button 
@@ -1166,7 +1375,7 @@ export default function App() {
             className={cn(
               "fixed z-[1000] bg-slate-950 transition-all duration-500 ease-in-out overflow-hidden",
               isMiniMode 
-                ? "bottom-20 right-4 w-64 h-48 rounded-3xl shadow-2xl border border-border-subtle dark:border-border-subtle" 
+                ? "bottom-20 right-4 w-64 h-48 rounded-3xl shadow-2xl border border-border-subtle" 
                 : "inset-0"
             )}
           >
@@ -1194,12 +1403,12 @@ export default function App() {
               </div>
 
               <div className={cn(
-                "absolute transition-all duration-500 overflow-hidden",
+                "absolute transition-all duration-500 overflow-hidden shadow-2xl",
                 isPinned 
                   ? "inset-0 z-10" 
                   : isMiniMode 
                     ? "bottom-2 right-2 w-20 h-28 rounded-xl z-20" 
-                    : "bottom-24 right-6 w-32 h-44 md:w-48 md:h-64 rounded-2xl z-20"
+                    : "top-6 right-6 w-28 h-40 md:top-auto md:bottom-24 md:right-6 md:w-48 md:h-64 rounded-2xl z-20"
               )}>
                 <video 
                   ref={localVideoRef} 
@@ -1272,91 +1481,209 @@ export default function App() {
                 </div>
               )}
 
+              {/* Side Panel */}
+              <AnimatePresence>
+                {isSidePanelOpen && !isMiniMode && (
+                  <motion.div 
+                    initial={{ x: '100%' }}
+                    animate={{ x: 0 }}
+                    exit={{ x: '100%' }}
+                    className="absolute top-0 right-0 bottom-0 w-80 md:w-96 bg-bg-surface/95 backdrop-blur-xl border-l border-white/10 z-30 flex flex-col shadow-2xl"
+                  >
+                    <div className="p-4 border-b border-border-subtle/50 flex items-center justify-between">
+                      <div className="flex gap-4">
+                        <button 
+                          onClick={() => setSidePanelTab('chat')}
+                          className={cn("text-sm font-bold transition-colors", sidePanelTab === 'chat' ? "text-brand-500" : "text-text-secondary")}
+                        >
+                          Chat
+                        </button>
+                        <button 
+                          onClick={() => setSidePanelTab('watch')}
+                          className={cn("text-sm font-bold transition-colors", sidePanelTab === 'watch' ? "text-brand-500" : "text-text-secondary")}
+                        >
+                          Watch
+                        </button>
+                      </div>
+                      <button onClick={() => setIsSidePanelOpen(false)} className="text-text-secondary hover:text-text-primary">
+                        <X size={20} />
+                      </button>
+                    </div>
+                    
+                    <div className="flex-1 overflow-hidden">
+                      {sidePanelTab === 'chat' ? (
+                        <div className="h-full flex flex-col">
+                          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                            {messages.map(msg => (
+                              <div key={msg.id} className={cn("flex flex-col", msg.isMine ? "items-end" : "items-start")}>
+                                <div className={cn(
+                                  "max-w-[85%] px-3 py-2 rounded-xl text-xs shadow-sm",
+                                  msg.isMine ? "bg-brand-500 text-white" : "bg-bg-base text-text-primary border border-border-subtle"
+                                )}>
+                                  {msg.text}
+                                </div>
+                              </div>
+                            ))}
+                            <div ref={chatEndRef} />
+                          </div>
+                          <div className="p-4 border-t border-border-subtle/50">
+                            <div className="flex gap-2">
+                              <input 
+                                type="text" 
+                                placeholder="Type..." 
+                                className="flex-1 bg-bg-base border border-border-subtle rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-brand-500 text-text-primary"
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    sendMessage(e.currentTarget.value);
+                                    e.currentTarget.value = '';
+                                  }
+                                }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="h-full p-4 flex flex-col gap-4">
+                          <div className="flex gap-2">
+                            <input 
+                              type="text" 
+                              placeholder="YouTube Link..." 
+                              value={youtubeUrl}
+                              onChange={(e) => setYoutubeUrl(e.target.value)}
+                              className="flex-1 bg-bg-base border border-border-subtle rounded-lg px-3 py-2 text-xs focus:outline-none focus:border-brand-500 text-text-primary" 
+                            />
+                            <button onClick={() => startWatchTogether(youtubeUrl)} className="p-2 bg-brand-500 text-white rounded-lg"><Play size={16} /></button>
+                          </div>
+                          {isWatchingTogether && youtubeUrl && (
+                            <div className="aspect-video rounded-xl overflow-hidden bg-black">
+                              <iframe 
+                                width="100%" height="100%" 
+                                src={`https://www.youtube.com/embed/${youtubeUrl.split('v=')[1]?.split('&')[0] || youtubeUrl.split('/').pop()}`}
+                                frameBorder="0" allowFullScreen
+                              ></iframe>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
               {/* Call Controls */}
               {!isMiniMode ? (
-                <div className="absolute bottom-0 left-0 right-0 p-8 flex flex-col items-center gap-6 bg-gradient-to-t from-black/40 to-transparent">
+                <div className="absolute bottom-0 left-0 right-0 p-4 md:p-8 flex flex-col items-center gap-4 md:gap-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
                   {/* Reaction Bar */}
-                  <div className="flex gap-2 p-2 bg-white/10 backdrop-blur-xl rounded-2xl border border-white/10">
+                  <div className="flex gap-1 md:gap-2 p-1.5 md:p-2 bg-white/10 backdrop-blur-xl rounded-2xl border border-white/10 overflow-x-auto max-w-[90vw] no-scrollbar">
                     {['👍', '❤️', '😂', '😮', '😢', '🔥'].map(emoji => (
                       <button 
                         key={emoji}
                         onClick={() => sendReaction(emoji)}
-                        className="p-2 hover:bg-white/10 rounded-xl transition-all text-xl active:scale-125"
+                        className="p-2 hover:bg-white/20 rounded-xl transition-all text-xl md:text-2xl active:scale-125 shrink-0"
                       >
                         {emoji}
                       </button>
                     ))}
                   </div>
 
-                  <div className="flex justify-center items-center gap-4">
+                  <div className="flex flex-wrap justify-center items-center gap-3 md:gap-4">
                     <button 
                       onClick={toggleMic}
                       className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all",
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
                         isMuted ? "bg-rose-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
                       )}
-                      title={isMuted ? "Unmute" : "Mute"}
                     >
-                      {isMuted ? <MicOff size={24} /> : <Mic size={24} />}
+                      {isMuted ? <MicOff size={22} /> : <Mic size={22} />}
                     </button>
                     <button 
                       onClick={toggleCam}
                       className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all",
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
                         isCamOff ? "bg-rose-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
                       )}
-                      title={isCamOff ? "Turn Camera On" : "Turn Camera Off"}
                     >
-                      {isCamOff ? <VideoOff size={24} /> : <Video size={24} />}
+                      {isCamOff ? <VideoOff size={22} /> : <Video size={22} />}
                     </button>
                     
                     <button 
                       onClick={toggleScreenShare}
                       className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all",
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
                         isScreenSharing ? "bg-emerald-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
                       )}
-                      title="Share Screen"
                     >
-                      <MonitorUp size={24} />
+                      <MonitorUp size={22} />
                     </button>
 
                     <button 
                       onClick={toggleHandRaise}
                       className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all",
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
                         isHandRaised ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
                       )}
-                      title="Raise Hand"
                     >
-                      <Hand size={24} />
+                      <Hand size={22} />
                     </button>
 
                     <button 
                       onClick={toggleRecording}
                       className={cn(
-                        "p-4 rounded-full backdrop-blur-md transition-all",
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
                         isRecording ? "bg-rose-500 text-white animate-pulse" : "bg-white/10 text-white hover:bg-white/20"
                       )}
-                      title={isRecording ? "Stop Recording" : "Start Recording"}
                     >
-                      {isRecording ? <CircleStop size={24} /> : <Download size={24} />}
+                      {isRecording ? <CircleStop size={22} /> : <Download size={22} />}
+                    </button>
+
+                    <button 
+                      onClick={() => setIsBlurEnabled(!isBlurEnabled)}
+                      className={cn(
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                        isBlurEnabled ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                      )}
+                    >
+                      <Palette size={22} />
+                    </button>
+
+                    <button 
+                      onClick={() => {
+                        setIsSidePanelOpen(!isSidePanelOpen);
+                        if (!isSidePanelOpen) setSidePanelTab('chat');
+                      }}
+                      className={cn(
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                        isSidePanelOpen && sidePanelTab === 'chat' ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                      )}
+                    >
+                      <MessageSquare size={22} />
+                    </button>
+
+                    <button 
+                      onClick={() => {
+                        setIsSidePanelOpen(!isSidePanelOpen);
+                        if (!isSidePanelOpen) setSidePanelTab('watch');
+                      }}
+                      className={cn(
+                        "p-4 rounded-full backdrop-blur-md transition-all shadow-lg",
+                        isSidePanelOpen && sidePanelTab === 'watch' ? "bg-brand-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
+                      )}
+                    >
+                      <Monitor size={22} />
                     </button>
 
                     <button 
                       onClick={endCall}
-                      className="p-5 bg-rose-500 hover:bg-rose-600 text-white rounded-full shadow-lg shadow-rose-500/30 transition-all active:scale-95"
-                      title="End Call"
+                      className="p-5 bg-rose-500 hover:bg-rose-600 text-white rounded-full shadow-xl shadow-rose-500/40 transition-all active:scale-90"
                     >
                       <PhoneOff size={28} />
                     </button>
                     
                     <button 
                       onClick={() => setIsMiniMode(true)}
-                      className="p-4 bg-white/10 text-white hover:bg-white/20 rounded-full backdrop-blur-md transition-all"
-                      title="Minimize"
+                      className="p-4 bg-white/10 text-white hover:bg-white/20 rounded-full backdrop-blur-md transition-all shadow-lg"
                     >
-                      <Minimize2 size={24} />
+                      <Minimize2 size={22} />
                     </button>
                   </div>
                 </div>
@@ -1446,11 +1773,11 @@ export default function App() {
           >
             <motion.div 
               initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }}
-              className="bg-bg-surface dark:bg-bg-surface border border-border-subtle dark:border-border-subtle rounded-[2rem] p-8 max-w-md w-full shadow-2xl"
+              className="bg-bg-surface border border-border-subtle rounded-[2rem] p-8 max-w-md w-full shadow-2xl"
             >
               <div className="flex items-center justify-between mb-8">
-                <h2 className="text-2xl font-bold text-text-primary dark:text-text-primary">Settings</h2>
-                <button onClick={() => setShowSettings(false)} className="p-2 hover:bg-slate-100 dark:hover:bg-bg-surface rounded-full transition-colors">
+                <h2 className="text-2xl font-bold text-text-primary">Settings</h2>
+                <button onClick={() => setShowSettings(false)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
                   <X size={20} className="text-slate-500" />
                 </button>
               </div>
@@ -1520,6 +1847,15 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Mobile Bottom Nav */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 h-16 bg-bg-surface border-t border-border-subtle flex items-center justify-around z-50 px-2">
+        <SidebarItem id="calls" icon={Phone} label="Calls" />
+        <SidebarItem id="chat" icon={MessageSquare} label="Chat" badge={unreadCount} />
+        <SidebarItem id="board" icon={PenTool} label="Board" />
+        <SidebarItem id="contacts" icon={Users} label="Peers" />
+        <SidebarItem id="help" icon={HelpCircle} label="Help" />
+      </nav>
 
       {/* Toast Notification */}
       <AnimatePresence>
